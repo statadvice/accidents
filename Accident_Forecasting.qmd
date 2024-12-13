@@ -1,0 +1,528 @@
+---
+title: "Accident Forecasting"
+format:
+  html:
+    self-contained: true
+    code-fold: show
+    code-summary: "Hide code"
+    fontsize: 14pt
+    code-tools: true
+toc: true
+editor: visual
+execute:
+  warning: false
+  error: false
+  cache: false
+---
+
+## Load packages
+
+```{r}
+library(tidyverse)
+library(sf)
+library(jsonlite)
+```
+
+## Import data
+
+```{r}
+# Specify the path to the geojson file
+file_path <- "sankt-peterburg.geojson"
+
+# Load the geojson file using sf
+geojson_data <- st_read(file_path)
+
+# If you want a flattened dataframe
+flattened_data <- as.data.frame(geojson_data)
+
+```
+
+## Prepare clean data
+
+```{r}
+data<-flattened_data%>%
+  select(id,point,datetime,severity, region)%>%
+  mutate(latitude = str_extract(point, '"lat":\\s*([0-9\\.\\-]+)') %>%
+      str_remove('"lat":\\s*') %>%
+      as.numeric(),
+      
+    longitude = str_extract(point, '"long":\\s*([0-9\\.\\-]+)') %>%
+      str_remove('"long":\\s*') %>%
+      as.numeric())%>%
+  select(-point)
+
+data$severity[data$severity=="Легкий"]<-"Light"
+data$severity[data$severity=="С погибшими"]<-"Fatal"
+data$severity[data$severity=="Тяжёлый"]<-"Severe"
+
+data$severity_binary<-"Light"
+data$severity_binary[data$severity%in%c("Severe","Fatal")]<-"Severe/Fatal"
+
+
+```
+
+## Remove outliers
+```{r}
+summary(data$latitude)
+summary(data$longitude)
+
+data<-data%>%filter(longitude>10)
+summary(data$longitude)
+```
+
+## Transliterate names of districts from Russian to English
+```{r}
+library(stringi)
+data$region<-gsub("rajon","district",stri_trans_general(data$region, "ru-Latn"))
+```
+
+## Keep only accidents from 2022 to 2024 with valid latitude and longitude
+```{r}
+data<-data%>%
+  filter(year(datetime)>=2022,
+         !is.na(latitude))
+```
+
+## Save data to xlsx file
+```{r}
+library(rio)
+export(data,"data.xlsx")
+```
+
+## Exploratory Data Analysis of Accident Count Dynamics Intra-Day and Intra-Week Seasonality
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+
+# Convert datetime to appropriate formats if necessary
+data <- data %>%
+  mutate(day_of_week = wday(datetime, label = TRUE, abbr = FALSE, week_start = 1), # Week starts on Monday
+         hour_of_day = hour(datetime))                                             # Extract hour
+
+# Traffic accidents by day of the week
+accidents_by_day <- data %>%
+  group_by(day_of_week) %>%
+  summarise(count = n())
+
+# Plot accidents by day of the week
+ggplot(accidents_by_day, aes(x = day_of_week, y = count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Traffic Accidents by Day of the Week (Monday Start)",
+       x = "Day of the Week", y = "Number of Accidents") +
+  theme_minimal()
+
+```
+
+## Analysis of determinants of accidents in each administrative district of Saint-Petersburg
+### Dataset
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)
+# keep only severe/fatal accidents
+#data<-data%>%
+  #filter(severity_binary=="Severe/Fatal")
+
+# 1. Extract hour, day of the week, and month
+data <- data %>%
+  mutate(
+    date = as.Date(datetime),
+    hour = hour(datetime),
+    day_of_week = wday(datetime, label = TRUE),
+    month = month(datetime, label = TRUE)
+  )
+
+# 2. Create a complete grid of dates, hours, and regions
+complete_grid <- expand_grid(
+  date = seq(min(data$date), max(data$date), by = "day"),
+  hour = 0:23,
+  region = unique(data$region)
+)
+
+# 3. Aggregate accident counts per district
+accidents_by_district <- data %>%
+  group_by(date, hour, region) %>%
+  summarise(accident_count = n(), .groups = 'drop')
+
+# 4. Merge with the complete grid to include all hours, even those with no accidents
+accidents_complete <- complete_grid %>%
+  left_join(accidents_by_district, by = c("date", "hour", "region")) %>%
+  mutate(accident_count = replace_na(accident_count, 0))
+
+# 5. Pivot to wide format with one column per region
+accidents_wide <- accidents_complete %>%
+  pivot_wider(names_from = region, values_from = accident_count, values_fill = 0)
+```
+
+### Append weather data
+Weather data was obtained through free weather API using the following API URL:
+https://archive-api.open-meteo.com/v1/archive?latitude=59.9386&longitude=30.3141&start_date=2022-01-01&end_date=2024-12-01&hourly=temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,precipitation,rain,snowfall,snow_depth,weather_code,pressure_msl,surface_pressure,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,et0_fao_evapotranspiration,vapour_pressure_deficit,wind_speed_10m,wind_speed_100m,wind_direction_10m,wind_direction_100m,wind_gusts_10m
+
+The dataset was saved as weather.xlsx, imported to R and appended to the hourly accidents dataset.
+```{r}
+weather<-import("weather.xlsx")%>%
+  mutate(date=as.Date(time),
+         hour=hour(time))
+
+accidents_wide<-accidents_wide%>%
+  left_join(weather)%>%
+  janitor::clean_names()
+```
+
+### Regression tree (outcome: each district's accident count in each hour)
+The analysis using regression trees has shown that analysis of accident counts for each city district has little predictive power and reveals only trivial rules like "the intensity of accidents is lower before 8am than after", and even these rules were inferred only for Nevskij and Vyborgskij districts. Part of the reason is that district division of Saint-Petersburg is rather arbitrary and does not account for accident hotspots. That is why it was decided to apply time series analysis for each cluster of hotspots rather than by any other arbitary division of the city.
+```{r}
+library(dplyr)
+library(rpart)
+
+# Prepare the dataset for tree-based modeling
+accidents_wide <- accidents_wide %>%
+  mutate(
+    day_of_week = as.factor(weekdays(date)), # Categorical day of week
+    month = as.factor(format(date, "%m"))    # Categorical month
+  )
+
+# Add lags for all variables ending with "_district"
+accidents_wide <- accidents_wide %>%
+  group_by(date) %>%
+  mutate(across(
+    ends_with("_district"),
+    .fns = list(
+      lag_1 = ~ lag(.x, 1),
+      lag_2 = ~ lag(.x, 2),
+      lag_3 = ~ lag(.x, 3),
+      lag_4 = ~ lag(.x, 4),
+      lag_24 = ~ lag(.x, 24),
+      lag_24_7 = ~ lag(.x, 24 * 7)
+    ),
+    .names = "{.col}_{.fn}"
+  )) %>%
+  ungroup()
+
+# Get all district variables
+district_vars <- colnames(accidents_wide) %>% 
+  .[grepl("_district$", .)]
+
+# Build a decision tree for each district variable
+tree_list <- list() # To store trees for each district variable
+
+for (district_var in district_vars) {
+  # Prepare data for the model, excluding current district and unnecessary columns
+  data_for_tree <- accidents_wide %>%
+    select(
+      -ends_with("_district"), 
+      -date, 
+      -time, 
+      all_of(district_var)
+    ) %>%
+    rename(target = all_of(district_var)) # Rename target variable for modeling
+
+  # Build the decision tree
+  tree <- rpart(
+    target ~ .,
+    data = data_for_tree,
+    method = "anova" # Change to "class" if classification is intended
+  )
+  
+  # Store the tree with the district variable name
+  tree_list[[district_var]] <- tree
+}
+```
+
+### Print regression tree rules
+```{r}
+library(rpart.plot)
+
+# Print rules for each tree in the list
+for (district_var in names(tree_list)) {
+  cat("\nRules for:", district_var, "\n")
+  print(rpart.rules(tree_list[[district_var]], style = "tallw", cover = TRUE))
+  cat("\n--------------------\n")
+}
+```
+
+## Analysis of determinants of accidents in each DBSCAN cluster of Saint-Petersburg
+### Dataset
+```{r}
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(dbscan)
+library(leaflet)
+
+# Step 1: Extract hour, day of the week, and month
+data <- data %>%
+  mutate(
+    date = as.Date(datetime),
+    hour = hour(datetime),
+    day_of_week = wday(datetime, label = TRUE),
+    month = month(datetime, label = TRUE)
+  )
+
+# Step 2: Prepare data for clustering
+# Select relevant features for clustering (e.g., latitude and longitude)
+clustering_data <- data %>%
+  select(latitude, longitude) %>%
+  distinct() # Remove duplicates to avoid redundancy in clustering
+
+# Step 3: Apply DBSCAN for clustering
+# Adjust `eps` and `minPts` based on your dataset
+dbscan_result <- dbscan::dbscan(
+  clustering_data,
+  eps = 0.01, # Adjust radius for clustering based on your data scale
+  minPts = 100  # Minimum points to form a cluster
+)
+
+# Add the cluster labels back to the dataset
+clustering_data <- clustering_data %>%
+  mutate(cluster = dbscan_result$cluster)
+
+# Merge cluster labels back to the main data
+data <- data %>%
+  left_join(clustering_data, by = c("latitude", "longitude"))
+
+# Step 4: Create a complete grid of dates, hours, and cluster numbers
+complete_grid <- expand_grid(
+  date = seq(min(data$date), max(data$date), by = "day"),
+  hour = 0:23,
+  cluster = unique(data$cluster)
+)
+
+# Step 5: Aggregate accident counts per cluster
+accidents_by_cluster <- data %>%
+  group_by(date, hour, cluster) %>%
+  summarise(accident_count = n(), .groups = 'drop')
+
+# Step 6: Merge with the complete grid to include all hours, even those with no accidents
+accidents_complete <- complete_grid %>%
+  left_join(accidents_by_cluster, by = c("date", "hour", "cluster")) %>%
+  mutate(accident_count = replace_na(accident_count, 0))
+
+# Step 7: Pivot to wide format with prefixed column names
+accidents_wide <- accidents_complete %>%
+  pivot_wider(
+    names_from = cluster,
+    names_prefix = "count_cluster_",
+    values_from = accident_count,
+    values_fill = 0
+  )
+
+# Step 8: Visualize clusters on a Leaflet map
+# Filter noise points (optional: cluster 0)
+clustering_data_filtered <- clustering_data %>%
+  filter(cluster > 0)
+
+# Create a color palette for clusters
+palette <- colorFactor(
+  palette = "Set1", # Choose a color palette
+  domain = clustering_data_filtered$cluster
+)
+
+# Generate the Leaflet map
+leaflet_map <- leaflet(clustering_data_filtered) %>%
+  addTiles() %>%  # Add base map tiles
+  addCircleMarkers(
+    ~longitude,
+    ~latitude,
+    color = ~palette(cluster),
+    radius = 5,
+    stroke = FALSE,
+    fillOpacity = 0.8,
+    label = ~paste("Cluster:", cluster)
+  )
+
+# Print the map
+leaflet_map
+
+```
+
+### Append weather data
+Weather data was obtained through free weather API using the following API URL:
+https://archive-api.open-meteo.com/v1/archive?latitude=59.9386&longitude=30.3141&start_date=2022-01-01&end_date=2024-12-01&hourly=temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,precipitation,rain,snowfall,snow_depth,weather_code,pressure_msl,surface_pressure,cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,et0_fao_evapotranspiration,vapour_pressure_deficit,wind_speed_10m,wind_speed_100m,wind_direction_10m,wind_direction_100m,wind_gusts_10m
+
+The dataset was saved as weather.xlsx, imported to R and appended to the hourly accidents dataset.
+```{r}
+weather<-import("weather.xlsx")%>%
+  mutate(date=as.Date(time),
+         hour=hour(time))
+
+accidents_wide<-accidents_wide%>%
+  left_join(weather)%>%
+  janitor::clean_names()
+```
+
+### Regression tree (oucome: each DBSCAN cluster's accident count)
+```{r}
+library(dplyr)
+library(rpart)
+
+# Prepare the dataset for tree-based modeling
+accidents_wide <- accidents_wide %>%
+  mutate(
+    day_of_week = as.factor(weekdays(date)), # Categorical day of week
+    month = as.factor(format(date, "%m")),  # Categorical month
+    hour = as.factor(hour)                  # Categorical hour
+  )
+
+# Add lags for all variables starting with "count_cluster_"
+accidents_wide <- accidents_wide %>%
+  group_by(date) %>%
+  mutate(across(
+    starts_with("count_cluster_"),
+    .fns = list(
+      lag_1 = ~ lag(.x, 1),
+      lag_2 = ~ lag(.x, 2),
+      lag_3 = ~ lag(.x, 3),
+      lag_4 = ~ lag(.x, 4),
+      lag_24 = ~ lag(.x, 24),
+      lag_24_7 = ~ lag(.x, 24 * 7)
+    ),
+    .names = "{.col}_{.fn}"
+  )) %>%
+  ungroup()
+
+# Get all original cluster variables (outcomes)
+outcome_vars <- colnames(accidents_wide) %>% 
+  .[grepl("^count_cluster_\\d+$", .)] # Only non-lagged variables
+
+# Get all lagged variables (predictors)
+predictor_vars <- colnames(accidents_wide) %>% 
+  .[grepl("^count_cluster_\\d+_lag_", .)]
+
+# Include additional predictors (month, day_of_week, hour)
+additional_predictors <- c("month", "day_of_week", "hour")
+
+# Build a decision tree for each outcome variable
+tree_list <- list() # To store trees for each outcome variable
+
+for (outcome_var in outcome_vars) {
+  # Prepare data for the model
+  data_for_tree <- accidents_wide %>%
+    select(
+      all_of(predictor_vars),       # Include lagged variables as predictors
+      all_of(additional_predictors),# Include additional predictors
+      all_of(outcome_var)           # Include only the current outcome variable
+    ) %>%
+    rename(target = all_of(outcome_var)) # Rename target variable for modeling
+
+  # Build the decision tree
+  tree <- rpart(
+    target ~ .,  # Use all remaining variables as predictors
+    data = data_for_tree,
+    method = "anova" # Change to "class" if classification is intended
+  )
+  
+  # Store the tree with the outcome variable name
+  tree_list[[outcome_var]] <- tree
+}
+```
+
+### Print regression tree rules
+```{r}
+library(rpart.plot)
+
+# Print rules for each tree in the list
+for (district_var in names(tree_list)) {
+  cat("\nRules for:", district_var, "\n")
+  print(rpart.rules(tree_list[[district_var]], style = "tallw", cover = TRUE))
+  cat("\n--------------------\n")
+}
+```
+
+
+
+Extremely low predictability of location and time of accidents was revealed suggesting that it is important to focus on hotspots revealed using the DBSCAN algorithm that create traffic bottlenecks and pose threat to human lives. 
+
+## Classification modeling of accident occurence
+In this version of the analysis we predict not the number of accidents, but the probability of its occurence.
+```{r}
+library(dplyr)
+library(rpart)
+
+# Prepare the dataset for tree-based modeling
+accidents_wide <- accidents_wide %>%
+  mutate(
+    day_of_week = as.factor(weekdays(date)), # Categorical day of week
+    month = as.factor(format(date, "%m")),  # Categorical month
+    hour = as.factor(hour)                  # Categorical hour
+  )
+
+# Add lags for all variables starting with "count_cluster_"
+accidents_wide <- accidents_wide %>%
+  group_by(date) %>%
+  mutate(across(
+    starts_with("count_cluster_"),
+    .fns = list(
+      lag_1 = ~ lag(.x, 1),
+      lag_2 = ~ lag(.x, 2),
+      lag_3 = ~ lag(.x, 3),
+      lag_4 = ~ lag(.x, 4),
+      lag_24 = ~ lag(.x, 24),
+      lag_24_7 = ~ lag(.x, 24 * 7)
+    ),
+    .names = "{.col}_{.fn}"
+  )) %>%
+  ungroup()
+
+# Convert outcome variables to binary (classification)
+# Binary outcome: 1 if accident count > 0, otherwise 0
+accidents_wide <- accidents_wide %>%
+  mutate(across(
+    starts_with("count_cluster_"),
+    ~ as.factor(ifelse(.x > 0, 1, 0)),
+    .names = "{.col}_binary"
+  ))
+
+# Get all binary outcome variables
+outcome_vars <- colnames(accidents_wide) %>%
+  .[grepl("^count_cluster_\\d+_binary$", .)] # Only binary variables
+
+# Get all lagged variables (predictors)
+predictor_vars <- colnames(accidents_wide) %>%
+  .[grepl("^count_cluster_\\d+_lag_", .)]
+
+# Include additional predictors (month, day_of_week, hour)
+additional_predictors <- c("month", "day_of_week", "hour")
+
+# Build a classification tree for each binary outcome variable
+tree_list <- list() # To store trees for each binary outcome variable
+
+for (outcome_var in outcome_vars) {
+  # Prepare data for the model
+  data_for_tree <- accidents_wide %>%
+    select(
+      all_of(predictor_vars),       # Include lagged variables as predictors
+      all_of(additional_predictors),# Include additional predictors
+      all_of(outcome_var)           # Include only the current binary outcome variable
+    ) %>%
+    rename(target = all_of(outcome_var)) # Rename target variable for modeling
+
+  # Build the classification tree
+  tree <- rpart(
+    target ~ .,  # Use all remaining variables as predictors
+    data = data_for_tree,
+    method = "class" # Classification model
+  )
+  
+  # Store the tree with the binary outcome variable name
+  tree_list[[outcome_var]] <- tree
+}
+
+```
+
+### Print classification tree rules
+
+```{r}
+library(rpart.plot)
+
+# Print rules for each tree in the list
+for (district_var in names(tree_list)) {
+  cat("\nRules for:", district_var, "\n")
+  print(rpart.rules(tree_list[[district_var]], style = "tallw", cover = TRUE))
+  cat("\n--------------------\n")
+}
+```
+
+The conclusion remained the same no matter which popular tree-based algorithm we used (Random Forest, XGboost, CatBoost). This might be due to the sparse nature of the data when each hotspot is comprised of only several events over the 2.5 year period. Further refinement of the DBSCAN clustering solution may help solve this issue.
